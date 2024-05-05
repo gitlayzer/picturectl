@@ -20,4 +20,3 @@
 - 在命令内写入自己编译生成的 picturectl.exe 的路径
 - 需要注意的是，这里需要在命令后面跟上你的图片的服务器地址
 - 比如：picturectl.exe F:\Software\Typora\picturectl.exe https://picture.xxxxxxxxxxx.com.cn
-![image-20240321154930617](https://picture.devops-engineer.com.cn/file/0609089c525fe6b0dad1e.png)
