@@ -6,83 +6,132 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 type Image struct {
 	Src string `json:"src"`
 }
 
+// UploadImage 函数使用多协程上传图片
 func UploadImage(cfPictureURL, filePath, fileFieldName string) error {
-	// 拼接上传图片的URL
 	postUrl := cfPictureURL + "/upload"
-	// 读取文件
+
+	// 打开文件
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("unable to open file: %v", err)
 	}
 	defer file.Close()
 
-	// 创建一个缓冲区来存储 multipart 的表单数据
-	var requestBody bytes.Buffer
-	multipartWriter := multipart.NewWriter(&requestBody)
-
-	// 创建表单文件部分
-	formFile, err := multipartWriter.CreateFormFile(fileFieldName, filepath.Base(file.Name()))
+	// 获取文件信息
+	fileInfo, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("partial failure to create form file: %v", err)
+		return fmt.Errorf("unable to get file info: %v", err)
 	}
 
-	// 将文件数据复制到表单
-	_, err = io.Copy(formFile, file)
-	if err != nil {
-		return fmt.Errorf("failed to copy file to form: %v", err)
+	// 计算块的数量
+	chunkSize := 5 * 1024 * 1024 // 5MB
+	numParts := int(math.Ceil(float64(fileInfo.Size()) / float64(chunkSize)))
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, numParts)
+
+	// 协程上传每个块
+	for i := 0; i < numParts; i++ {
+		wg.Add(1)
+		go func(partNumber int) {
+			defer wg.Done()
+			partSize := chunkSize
+			if i == numParts-1 {
+				partSize = int(fileInfo.Size()) - (i * chunkSize)
+			}
+
+			// 创建一个新的缓冲区来读取每个部分
+			filePart := make([]byte, partSize)
+
+			// 定位到文件的当前块的起始位置
+			_, err := file.Seek(int64(i)*int64(chunkSize), io.SeekStart)
+			if err != nil {
+				errChan <- fmt.Errorf("error seeking to file part %d: %v", i+1, err)
+				return
+			}
+
+			// 读取当前块的数据
+			_, err = io.ReadFull(file, filePart)
+			if err != nil {
+				errChan <- fmt.Errorf("error reading file part %d: %v", i+1, err)
+				return
+			}
+
+			// 创建HTTP请求
+			body := new(bytes.Buffer)
+			writer := multipart.NewWriter(body)
+			part, err := writer.CreateFormFile(fileFieldName, fmt.Sprintf("%s.part%d", filepath.Base(file.Name()), partNumber))
+			if err != nil {
+				errChan <- err
+				return
+			}
+			_, err = part.Write(filePart)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			writer.Close()
+
+			req, err := http.NewRequest(http.MethodPost, postUrl, body)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+
+			client := &http.Client{}
+			resp, err := client.Do(req)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				errChan <- fmt.Errorf("failed to upload part %d, status: %s", partNumber, resp.Status)
+			}
+
+			responseBody := &bytes.Buffer{}
+			_, err = responseBody.ReadFrom(resp.Body)
+			if err != nil {
+				errChan <- fmt.Errorf("error reading response body: %v", err)
+				return
+			}
+			result := responseBody.String()
+
+			var images []Image
+			err = json.Unmarshal([]byte(result), &images)
+			if err != nil {
+				log.Fatalf("JSON parsing error: %v", err)
+			}
+
+			fmt.Println(cfPictureURL + images[0].Src)
+		}(i)
 	}
 
-	// 关闭multipart writer来设置表单的最终边界
-	multipartWriter.Close()
+	// 等待所有协程完成
+	wg.Wait()
+	close(errChan)
 
-	// 创建HTTP请求
-	request, err := http.NewRequest(http.MethodPost, postUrl, &requestBody)
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %v", err)
+	// 检查是否有错误发生
+	if len(errChan) > 0 {
+		for err := range errChan {
+			fmt.Println("Error:", err)
+		}
+		return fmt.Errorf("one or more errors occurred during upload")
 	}
-	// 设置Content-Type头部，这样服务器知道是multipart/form-data
-	request.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-
-	// 发送请求
-	client := &http.Client{}
-	response, err := client.Do(request)
-	if err != nil {
-		return fmt.Errorf("sending request failed: %v", err)
-	}
-	defer response.Body.Close()
-
-	// 检查响应状态码
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %v", response.Status)
-	}
-
-	// 打印响应内容
-	responseBody := &bytes.Buffer{}
-	_, err = responseBody.ReadFrom(response.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response: %v", err)
-	}
-	result := responseBody.String()
-
-	// 解析JSON
-	var images []Image
-	err = json.Unmarshal([]byte(result), &images)
-	if err != nil {
-		log.Fatalf("JSON parsing error: %v", err)
-	}
-
-	// 检查是否有结果并打印出来
-	fmt.Println(cfPictureURL + images[0].Src)
 
 	return nil
 }
